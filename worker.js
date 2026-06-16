@@ -81,9 +81,11 @@ async function syncAccount(acct, blockedPatterns, bccAddress) {
   if (!password) { await setSync(acct.id, { state: "error", last_error: `Worker env var ${acct.credential_ref} is not set` }); return; }
   await setSync(acct.id, { state: "syncing", last_error: null });
 
+  for (let attempt = 1; attempt <= 3; attempt++) {
   const client = new ImapFlow({
     host: acct.imap_host, port: acct.imap_port, secure: true, logger: false,
     auth: { user: acct.address, pass: password },
+    connectionTimeout: 30000, greetingTimeout: 20000, socketTimeout: 120000,
   });
   let synced = 0;
   try {
@@ -176,11 +178,18 @@ async function syncAccount(acct, blockedPatterns, bccAddress) {
     await sb.from("audit_logs").insert({ action: "EMAIL_SYNC", entity: "email_accounts",
       record_id: acct.id, diff: { address: acct.address, new_messages: synced } });
     console.log(`[sync] ${acct.address}: ${synced} new`);
-  } catch (e) {
-    console.error(`[sync] ${acct.address} FAILED:`, e.message);
-    await setSync(acct.id, { state: "error", last_error: e.message });
-  } finally {
     await client.logout().catch(() => {});
+    return; // success — this mailbox is done
+  } catch (e) {
+    await client.logout().catch(() => {});
+    if (attempt < 3) {
+      console.error(`[sync] ${acct.address} attempt ${attempt} failed (${e.message}) — retrying in ${8 * attempt}s`);
+      await new Promise((r) => setTimeout(r, 8000 * attempt));
+      continue;
+    }
+    console.error(`[sync] ${acct.address} FAILED after ${attempt} attempts:`, e.message);
+    await setSync(acct.id, { state: "error", last_error: e.message });
+  }
   }
 }
 
