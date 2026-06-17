@@ -99,8 +99,13 @@ async function syncAccount(acct, blockedPatterns, bccAddress) {
   const client = new ImapFlow({
     host: acct.imap_host, port: acct.imap_port, secure: true, logger: false,
     auth: { user: acct.address, pass: password },
-    connectionTimeout: 30000, greetingTimeout: 20000, socketTimeout: 120000,
+    connectionTimeout: 30000, greetingTimeout: 20000, socketTimeout: 240000,
   });
+  // ImapFlow fires an 'error' event on socket problems (e.g. ETIMEOUT). With no
+  // listener, Node treats it as fatal and crashes the whole run with exit code 1 —
+  // underneath the try/catch below. Handling it here turns the crash into a normal
+  // rejection the retry loop can catch and recover from.
+  client.on("error", (err) => console.error(`[imap] ${acct.address} connection error: ${err?.message || err}`));
   let synced = 0;
   try {
     await client.connect();
@@ -271,7 +276,7 @@ async function sendScheduled(accounts) {
 // ---------- main -------------------------------------------------------------
 async function pass() {
   console.log("======================================================");
-  console.log("🟢 CRASHPROOF BUILD v4 — chunked + clean-exit (no more 10-min hang)");
+  console.log("🟢 CRASHPROOF BUILD v5 — handles socket timeouts (no more exit-code-1 crash)");
   console.log("======================================================");
   runSeen = 0;
   const { data: blocked } = await sb.from("blocked_emails").select("pattern");
