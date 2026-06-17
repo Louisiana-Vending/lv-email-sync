@@ -16,6 +16,8 @@ import { createClient } from "@supabase/supabase-js";
 const need = (k) => { const v = process.env[k]; if (!v) { console.error(`Missing env ${k}`); process.exit(1); } return v; };
 const sb = createClient(need("SUPABASE_URL"), need("SUPABASE_SERVICE_ROLE_KEY"));
 const SKIP_FOLDERS = /(junk|spam|trash|deleted)/i; // never sync these even on "all folders"
+const RUN_BUDGET = 150; // max messages examined per run across ALL mailboxes — keeps every run short so it finishes (and is never killed mid-backlog). The 15-min cron resumes where it left off.
+let runSeen = 0;        // reset at the start of every pass()
 
 const normSubject = (s) => (s || "(no subject)").replace(/^((re|fwd|fw)\s*:\s*)+/i, "").trim().toLowerCase();
 const addrList = (a) => (a?.value ?? []).map((v) => v.address?.toLowerCase()).filter(Boolean);
@@ -101,6 +103,7 @@ async function syncAccount(acct, blockedPatterns, bccAddress) {
     const { data: folders } = await sb.from("email_folders").select("*").eq("account_id", acct.id);
 
     for (const f of folders ?? []) {
+      if (runSeen >= RUN_BUDGET) break;
       if (SKIP_FOLDERS.test(f.path)) continue;
       if (!acct.sync_all_folders && !f.selected) continue;
 
@@ -131,6 +134,17 @@ async function syncAccount(acct, blockedPatterns, bccAddress) {
         for await (const msg of client.fetch(range, { uid: true, source: true }, { uid: typeof range === "string" })) {
           if (msg.uid <= lastUid) continue;
           maxUid = Math.max(maxUid, msg.uid);
+          runSeen++;
+          // Save progress every 25 messages so a cancelled run never loses its place,
+          // and stop after RUN_BUDGET so each run finishes fast (the 15-min cron resumes).
+          if (runSeen % 25 === 0) {
+            await sb.from("email_folders").update({ last_uid: maxUid, uidvalidity: String(box.uidValidity) }).eq("id", f.id);
+            console.log(`[sync] ${acct.address} ${f.path}: ${runSeen} scanned this run, ${synced} new — progress saved`);
+          }
+          if (runSeen >= RUN_BUDGET) {
+            console.log(`[sync] ${acct.address} ${f.path}: hit per-run cap (${RUN_BUDGET}) — pausing here; the next 15-min run resumes automatically`);
+            break;
+          }
           const parsed = await simpleParser(msg.source);
           const from = parsed.from?.value?.[0]?.address?.toLowerCase() ?? "";
           if (isBlocked(from, blockedPatterns)) continue;                  // blocked senders ignored
@@ -243,15 +257,20 @@ async function sendScheduled(accounts) {
 // ---------- main -------------------------------------------------------------
 async function pass() {
   console.log("======================================================");
-  console.log("🟢 CRASHPROOF BUILD v2 — skips bad emails, auto-retries 3×, 6-month cap");
+  console.log("🟢 CRASHPROOF BUILD v3 — chunked sync, saves progress every 25, auto-retries 3×");
   console.log("======================================================");
+  runSeen = 0;
   const { data: blocked } = await sb.from("blocked_emails").select("pattern");
   const patterns = (blocked ?? []).map((b) => b.pattern.toLowerCase());
   const bccAddress = (process.env.SMART_BCC_ADDRESS || "").toLowerCase() || null;
   const { data: accounts } = await sb.from("email_accounts").select("*");
   const active = (accounts ?? []).filter((a) => a.sync_active && !a.address.startsWith("PLACEHOLDER"));
-  for (const acct of active) await syncAccount(acct, patterns, bccAddress);
+  for (const acct of active) {
+    if (runSeen >= RUN_BUDGET) { console.log("[sync] per-run cap reached — remaining mailboxes continue on the next run"); break; }
+    await syncAccount(acct, patterns, bccAddress);
+  }
   await sendScheduled(accounts ?? []);
+  console.log(`[sync] pass complete — ${runSeen} messages examined this run`);
 }
 
 const loopIdx = process.argv.indexOf("--loop");
