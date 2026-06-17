@@ -30,6 +30,18 @@ async function setSync(accountId, patch) {
   await sb.from("email_sync_status").upsert({ account_id: accountId, ...patch, updated_at: new Date().toISOString() });
 }
 
+// Close an IMAP connection without hanging. We try a graceful LOGOUT but never
+// wait more than 5s — Hostinger sometimes stalls on LOGOUT, which used to keep
+// the whole worker alive until the 10-minute job timeout killed it.
+async function safeClose(client) {
+  try {
+    await Promise.race([
+      client.logout(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("logout timed out")), 5000)),
+    ]);
+  } catch { try { client.close(); } catch { /* already gone */ } }
+}
+
 // ---------- thread resolution + record linking ------------------------------
 async function resolveThread(acct, parsed, participants) {
   // Prefer real RFC threading (References / In-Reply-To root), fall back to
@@ -200,10 +212,10 @@ async function syncAccount(acct, blockedPatterns, bccAddress) {
     await sb.from("audit_logs").insert({ action: "EMAIL_SYNC", entity: "email_accounts",
       record_id: acct.id, diff: { address: acct.address, new_messages: synced } });
     console.log(`[sync] ${acct.address}: ${synced} new`);
-    await client.logout().catch(() => {});
+    await safeClose(client);
     return; // success — this mailbox is done
   } catch (e) {
-    await client.logout().catch(() => {});
+    await safeClose(client);
     const msg = e?.message || String(e);
     if (attempt < 3) {
       console.error(`[sync] ${acct.address} attempt ${attempt} failed (${msg}) — retrying in ${8 * attempt}s`);
@@ -226,7 +238,8 @@ async function sendScheduled(accounts) {
     if (!acct || !password) continue;
     try {
       const tx = nodemailer.createTransport({ host: acct.smtp_host, port: acct.smtp_port,
-        secure: acct.smtp_port === 465, auth: { user: acct.address, pass: password } });
+        secure: acct.smtp_port === 465, auth: { user: acct.address, pass: password },
+        connectionTimeout: 15000, greetingTimeout: 10000, socketTimeout: 20000 });
       const messageId = `<${crypto.randomUUID()}@${acct.address.split("@")[1]}>`;
       await tx.sendMail({ from: `${acct.custom_sender_name || acct.sender_name} <${acct.address}>`,
         to: s.to_addresses.join(","), cc: (s.cc_addresses ?? []).join(",") || undefined,
@@ -250,6 +263,7 @@ async function sendScheduled(accounts) {
       await sb.from("audit_logs").insert({ actor: s.created_by, action: "EMAIL_SEND", entity: "scheduled_emails",
         record_id: s.id, diff: { scheduled: true, to: s.to_addresses, subject: s.subject } });
       console.log(`[scheduled] sent "${s.subject}" → ${s.to_addresses.join(",")}`);
+      tx.close();
     } catch (e) { console.error(`[scheduled] ${s.id} failed:`, e.message); }
   }
 }
@@ -257,7 +271,7 @@ async function sendScheduled(accounts) {
 // ---------- main -------------------------------------------------------------
 async function pass() {
   console.log("======================================================");
-  console.log("🟢 CRASHPROOF BUILD v3 — chunked sync, saves progress every 25, auto-retries 3×");
+  console.log("🟢 CRASHPROOF BUILD v4 — chunked + clean-exit (no more 10-min hang)");
   console.log("======================================================");
   runSeen = 0;
   const { data: blocked } = await sb.from("blocked_emails").select("pattern");
@@ -280,6 +294,14 @@ if (loopIdx > -1) {
   // eslint-disable-next-line no-constant-condition
   while (true) { await pass(); await new Promise((r) => setTimeout(r, secs * 1000)); }
 } else {
+  // Safety net: never let a single run hang. If anything stalls, force a clean
+  // exit at 6 min (well under the job's 10-min limit). Progress is saved every
+  // 25 messages, so quitting early loses nothing — the next run just resumes.
+  const watchdog = setTimeout(() => {
+    console.log("⏱️ watchdog: 6-min safety limit reached — exiting cleanly (progress already saved; next run resumes).");
+    process.exit(0);
+  }, 6 * 60 * 1000);
   await pass();
+  clearTimeout(watchdog);
   process.exit(0);
 }
