@@ -242,6 +242,9 @@ async function sendScheduled(accounts) {
 
 // ---------- main -------------------------------------------------------------
 async function pass() {
+  console.log("======================================================");
+  console.log("🟢 CRASHPROOF BUILD v2 — skips bad emails, auto-retries 3×, 6-month cap");
+  console.log("======================================================");
   const { data: blocked } = await sb.from("blocked_emails").select("pattern");
   const patterns = (blocked ?? []).map((b) => b.pattern.toLowerCase());
   const bccAddress = (process.env.SMART_BCC_ADDRESS || "").toLowerCase() || null;
