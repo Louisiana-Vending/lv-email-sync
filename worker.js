@@ -142,6 +142,7 @@ async function syncAccount(acct, blockedPatterns, bccAddress) {
           const isBcc = bccAddress && acct.address.toLowerCase() === bccAddress;
 
           const thread = await resolveThread(acct, parsed, participants);
+          if (!thread?.id) continue; // thread couldn't be resolved (transient DB hiccup) — skip this one; next pass picks it up
           const { data: inserted, error } = await sb.from("emails").insert({
             thread_id: thread.id, account_id: acct.id, message_id: messageId,
             in_reply_to: parsed.inReplyTo ?? null, direction, folder: f.path,
@@ -189,13 +190,14 @@ async function syncAccount(acct, blockedPatterns, bccAddress) {
     return; // success — this mailbox is done
   } catch (e) {
     await client.logout().catch(() => {});
+    const msg = e?.message || String(e);
     if (attempt < 3) {
-      console.error(`[sync] ${acct.address} attempt ${attempt} failed (${e.message}) — retrying in ${8 * attempt}s`);
+      console.error(`[sync] ${acct.address} attempt ${attempt} failed (${msg}) — retrying in ${8 * attempt}s`);
       await new Promise((r) => setTimeout(r, 8000 * attempt));
       continue;
     }
-    console.error(`[sync] ${acct.address} FAILED after ${attempt} attempts:`, e.message);
-    await setSync(acct.id, { state: "error", last_error: e.message });
+    console.error(`[sync] ${acct.address} FAILED after ${attempt} attempts:`, msg);
+    await setSync(acct.id, { state: "error", last_error: msg });
   }
   }
 }
