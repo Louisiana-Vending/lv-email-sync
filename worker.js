@@ -111,13 +111,20 @@ async function syncAccount(acct, blockedPatterns, bccAddress) {
         let lastUid = Number(f.last_uid) || 0;
         if (f.uidvalidity && String(box.uidValidity) !== String(f.uidvalidity)) lastUid = 0; // server reset
 
-        // Honor "sync past emails" + start date on the very first pass
+        // Honor "sync past emails" + start date on the very first pass.
+        // Safeguard: when no start date is set, default to the last 6 months so
+        // the first sync finishes within the time limit instead of pulling years
+        // of history and timing out. New mail always keeps syncing after that;
+        // set a "Sync start date" on the account to go further back.
         let range = `${lastUid + 1}:*`;
         if (lastUid === 0) {
           if (!acct.sync_past) {
             range = { since: new Date() };
           } else if (acct.sync_start_date) {
             range = { since: new Date(acct.sync_start_date) };
+          } else {
+            const since = new Date(); since.setMonth(since.getMonth() - 6);
+            range = { since };
           }
         }
         let maxUid = lastUid;
